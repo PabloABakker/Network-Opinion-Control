@@ -253,3 +253,136 @@ def evaluate_pomp(Xf, C, C_tilde, safe_col_norms, s, N=25, T=25):
     }
 
 
+# Piecewise SBL implementation
+def sbl_piecewise(
+    Phi, y, s, N=25, T=25,
+    max_iter=500,
+    tol=1e-8,
+    sigma2=1e-8,
+    gamma_init=1.0,
+    prune_gamma=1e-12,
+    refit=True,
+):
+    """
+    Piecewise Sparse Bayesian Learning.
+
+    Learns one variance gamma_{i,t} per coefficient, then enforces
+        ||u_t||_0 <= s
+    by keeping the s largest posterior variances per time block.
+
+    Returns:
+        z              final estimate
+        support        active indices
+        residual_norms residual history
+        gamma          learned SBL hyperparameters
+    """
+
+    m, n = Phi.shape
+    assert n == N * T
+
+    gamma = gamma_init * np.ones(n)
+    residual_norms = []
+
+    z = np.zeros(n)
+
+    for _ in range(max_iter):
+        gamma_old = gamma.copy()
+
+        Gamma = np.diag(gamma)
+
+        Sigma_y = Phi @ Gamma @ Phi.T + sigma2 * np.eye(m)
+
+        # Posterior mean
+        alpha = np.linalg.solve(Sigma_y, y)
+        mu = gamma * (Phi.T @ alpha)
+
+        # Posterior covariance diagonal
+        B = np.linalg.solve(Sigma_y, Phi @ Gamma)
+        Sigma_diag = gamma - np.sum((Gamma @ Phi.T) * B.T, axis=1)
+
+        # EM update
+        gamma = mu**2 + Sigma_diag
+        gamma = np.maximum(gamma, 0.0)
+
+        # Numerical pruning
+        gamma[gamma < prune_gamma] = 0.0
+
+        z = mu.copy()
+
+        residual = y - Phi @ z
+        residual_norms.append(np.linalg.norm(residual))
+
+        rel_change = np.linalg.norm(gamma - gamma_old) / (np.linalg.norm(gamma_old) + 1e-16)
+
+        if rel_change < tol:
+            break
+
+    # Enforce piecewise sparsity: keep top s gammas in each time block
+    support = []
+
+    for t in range(T):
+        start, end = t * N, (t + 1) * N
+        local_gamma = gamma[start:end]
+
+        if s >= N:
+            local_support = np.arange(N)
+        else:
+            local_support = np.argsort(np.abs(local_gamma))[-s:]
+
+        local_support = local_support[local_gamma[local_support] > prune_gamma]
+        support.extend(start + local_support)
+
+    support = np.array(sorted(support), dtype=int)
+
+    z_final = np.zeros(n)
+
+    if len(support) > 0:
+        if refit:
+            Phi_S = Phi[:, support]
+            z_S, *_ = np.linalg.lstsq(Phi_S, y, rcond=None)
+            z_final[support] = z_S
+        else:
+            z_final[support] = z[support]
+
+    residual = y - Phi @ z_final
+    residual_norms.append(np.linalg.norm(residual))
+
+    return z_final, support, residual_norms, gamma
+
+
+
+
+# Evaluate PCSBL over all the final states
+def evaluate_sbl_piecewise(Xf, C, C_tilde, safe_col_norms, s, N=25, T=25):
+    errors = []
+    energies = []
+    U_hat = []
+    gammas = []
+
+    for y in Xf:
+        z_hat, _, _, gamma = sbl_piecewise(
+            Phi=C_tilde,
+            y=y,
+            s=s,
+            N=N,
+            T=T,
+            max_iter=500,
+            tol=1e-8,
+            sigma2=1e-8,
+            refit=True,
+        )
+
+        u_hat = z_hat / safe_col_norms
+        x_hat = C @ u_hat
+
+        errors.append(np.linalg.norm(y - x_hat) / np.linalg.norm(y))
+        energies.append(np.linalg.norm(u_hat))
+        U_hat.append(u_hat)
+        gammas.append(gamma)
+
+    return {
+        "errors": np.array(errors),
+        "energies": np.array(energies),
+        "U_hat": np.array(U_hat),
+        "gammas": np.array(gammas),
+    }
